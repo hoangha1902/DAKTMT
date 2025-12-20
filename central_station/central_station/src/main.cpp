@@ -1,229 +1,493 @@
+/**
+ * Central Station - Smart Irrigation
+ * -------------------------------------------------
+ * Vai trò:
+ *  - Nhận lệnh từ Gateway qua ESP-NOW: bật/tắt Pump 1/2
+ *  - Đọc cảm biến lưu lượng (Flow sensor) cho Pump 1/2
+ *  - Đọc mức nước bể (tank level) (analog % hoặc công tắc báo cạn)
+ *  - Áp dụng fail-safe: bể cạn / dry-run / relay-stuck (ước lượng)
+ *  - Gửi telemetry trạng thái về Gateway qua ESP-NOW theo format tương thích main_gateway.cpp
+ 
+ * GÓI TIN GỬI VỀ GATEWAY (struct_message):
+ *  - ID_CENTRAL_SUM (0): temp=tank_level_pct, hum=pump_status_bits, soil=error_code (0 ok, 2 lỗi)
+ *  - ID_PUMP1 (10): temp=pump1_flow_lpm, hum=pump1_total_l, soil=pump1_status_bits
+ *  - ID_PUMP2 (11): temp=pump2_flow_lpm, hum=pump2_total_l, soil=pump2_status_bits
+ *  - ID_TANK  (12): temp=tank_level_pct, hum=tank_level_l, soil=tank_flags_bits
+
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
+#include <Preferences.h>
 
-// ================= MODULE 1: CẤU HÌNH PHẦN CỨNG =================
-// Output: Relay kích hoạt máy bơm (Kích High hoặc Low tùy module)
-#define RELAY_1_PIN 4   // Bơm Zone 1
-#define RELAY_2_PIN 5   // Bơm Zone 2
+// ======================================================
+// 1) CẤU HÌNH 
+// ======================================================
 
-// Input: Cảm biến lưu lượng (YF-S201: 1 Lít = 450 xung)
-#define FLOW_1_PIN  6   // Đo nước ra Zone 1
-#define FLOW_2_PIN  7   // Đo nước ra Zone 2
 
-// Input: Giả lập phao nước (Nối đất = Cạn, Thả nổi = Đầy)
-// Dùng GPIO 10 với chế độ INPUT_PULLUP
-#define WATER_LEVEL_PIN 10 
+#ifndef WIFI_CHANNEL
+#define WIFI_CHANNEL 11
+#endif
 
-// ================= MODULE 2: CẤU HÌNH MẠNG =================
-#define WIFI_CHANNEL 6  // Bắt buộc trùng Gateway
-#define MY_ID        0  // ID 0 dành riêng cho Trạm Trung Tâm
+// --- MAC địa chỉ của CENTRAL và GATEWAY ---
+static uint8_t CENTRAL_BASE_MAC[6] = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x05};
+static uint8_t GATEWAY_MAC[6]      = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x01};
 
-// MAC Gateway (...:01)
-uint8_t gatewayMac[] = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x01};
+// --- Relay pins (điều khiển bơm) ---
+static constexpr int RELAY_1_PIN = 26;
+static constexpr int RELAY_2_PIN = 27;
 
-// MAC của Node Bể Chứa (Đuôi ...:05 cho khác biệt)
-uint8_t myMac[]      = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x05}; 
+// Relay active level: nhiều module relay active-LOW
+static constexpr bool RELAY_ACTIVE_LOW = true;
 
-// ================= MODULE 3: BIẾN TOÀN CỤC & STRUCT =================
+// --- Flow sensor pins (ngắt) ---
+static constexpr int FLOW_1_PIN = 34; // GPIO34/35 chỉ input
+static constexpr int FLOW_2_PIN = 35;
 
-// Struct GỬI đi (Phải khớp Gateway để không bị lỗi)
-// Mẹo: Tận dụng các biến có sẵn để chứa dữ liệu nước
-// temp -> Chứa Tốc độ chảy (L/min)
-// hum  -> Chứa Tổng lượng nước (Lít)
-// soil -> Chứa Trạng thái Relay (0=Tắt, 1=Bật, 2=Lỗi)
+// --- Tank level ---
+// Mode 1: Analog level (%) từ cảm biến mức nước (0..4095)
+// Mode 2: Float switch báo cạn (digital)
+enum TankLevelMode : uint8_t { TANK_LEVEL_ANALOG = 0, TANK_LEVEL_FLOAT_SWITCH = 1 };
+static constexpr TankLevelMode TANK_MODE = TANK_LEVEL_ANALOG;
+
+// (A) Analog tank level
+static constexpr int TANK_LEVEL_ADC_PIN = 32;     // nếu dùng analog
+static constexpr int TANK_ADC_MIN = 800;          // calib: giá trị ADC khi bể gần cạn
+static constexpr int TANK_ADC_MAX = 3200;         // calib: giá trị ADC khi bể đầy
+static constexpr float TANK_CAPACITY_L = 4500.0f; // 4000-5000L
+
+// (B) Float switch báo cạn (active LOW, INPUT_PULLUP)
+static constexpr int TANK_LOW_SWITCH_PIN = 25;    // nếu dùng float switch
+
+// ======================================================
+// 2) CẤU HÌNH LOGIC AN TOÀN (FAIL-SAFE)
+// ======================================================
+
+// Flow sensor calibration: pulses per liter (tuỳ loại YF-S201/YF-S402...)
+// Nếu không chắc: để 450.0 rồi đo thực tế (đổ 10L xem total tăng bao nhiêu).
+static constexpr float PULSES_PER_LITER = 450.0f;
+
+// Nếu bơm ON nhưng flow < MIN_FLOW_LPM kéo dài -> dry-run (bơm chạy khan / mất nước / kẹt)
+static constexpr float MIN_FLOW_LPM = 0.3f;
+static constexpr uint32_t DRYRUN_GRACE_MS   = 3000;   // cho phép vài giây đầu chưa có nước
+static constexpr uint32_t DRYRUN_TIMEOUT_MS = 8000;   // quá thời gian này mà flow vẫn thấp -> lỗi
+
+// Nếu bơm OFF nhưng flow vẫn cao kéo dài -> nghi relay bị dính (hoặc van kẹt)
+static constexpr float RELAY_STUCK_FLOW_LPM = 0.5f;
+static constexpr uint32_t RELAY_STUCK_TIMEOUT_MS = 5000;
+
+// Ngưỡng bể cạn theo % (khi dùng analog)
+static constexpr float TANK_LOW_PCT_THRESHOLD = 8.0f;
+
+// Chu kỳ xử lý & gửi report
+static constexpr uint32_t TICK_MS = 1000;          // tính toán 1s/lần
+static constexpr uint32_t REPORT_MS = 2000;        // gửi report 2s/lần
+static constexpr uint32_t SAVE_MS = 60000;         // lưu NVS 60s/lần để tránh mòn flash
+
+// ======================================================
+// 3) ĐỊNH NGHĨA ID / BIT
+// ======================================================
+#define ID_CENTRAL_SUM          0
+#define ID_PUMP1                10
+#define ID_PUMP2                11
+#define ID_TANK                 12
+
+#define PUMP_BIT_ON             0x01
+#define PUMP_BIT_DRYRUN         0x02
+#define PUMP_BIT_RELAY_STUCK    0x04
+
+#define TANK_FLAG_LOW_PCT       0x01
+#define TANK_FLAG_LOW_SWITCH    0x02
+
+// ======================================================
+// 4) STRUCT GIAO TIẾP ESPNOW
+// ======================================================
 typedef struct {
-  int id;       
-  float flow_rate;   // (Mapping vào temp bên Gateway)
-  float total_vol;   // (Mapping vào hum bên Gateway)
-  float status;      // (Mapping vào soil bên Gateway)
+  int   id;
+  float temp;
+  float hum;
+  float soil;
 } struct_message;
 
-struct_message myData;
-
-// Struct NHẬN lệnh (Command từ Gateway)
 typedef struct {
-  int cmd_id;    // 1: Điều khiển Bơm
-  int pump_id;   // 1 hoặc 2
-  int action;    // 1: Bật, 0: Tắt
+  int cmd_id;
+  int pump_id;
+  int action; // 1=ON, 0=OFF
 } struct_command;
 
-struct_command incomingCmd;
+// ======================================================
+// 5) TRẠNG THÁI HỆ THỐNG
+// ======================================================
+static Preferences prefs;
 
-// Biến cho Cảm biến lưu lượng (VOLATILE là bắt buộc cho ngắt)
-volatile long pulseCount1 = 0;
-volatile long pulseCount2 = 0;
-float flowRate1 = 0.0, flowRate2 = 0.0;
-float totalVol1 = 0.0, totalVol2 = 0.0;
+static volatile uint32_t pulseCount1 = 0;
+static volatile uint32_t pulseCount2 = 0;
 
-unsigned long oldTime = 0;
-const float CALIBRATION_FACTOR = 7.5; // Tùy chỉnh theo loại cảm biến (7.5 cho YF-S201)
+struct PumpState {
+  bool desiredOn = false;
+  bool relayOn   = false;
 
-// Biến bảo vệ (Safety)
-bool pump1State = false;
-bool pump2State = false;
-bool pump1Error = false; // Cờ báo lỗi chạy khô
-unsigned long pump1StartTime = 0; // Thời điểm bắt đầu bật
+  bool dryRun = false;
+  bool relayStuck = false;
 
-// ================= MODULE 4: XỬ LÝ NGẮT (INTERRUPT) =================
-// Hàm này chạy cực nhanh mỗi khi cánh quạt quay 1 vòng
-void IRAM_ATTR pulseCounter1() {
-  pulseCount1++;
-}
-void IRAM_ATTR pulseCounter2() {
-  pulseCount2++;
-}
+  uint32_t onSinceMs = 0;
+  uint32_t flowBadSinceMs = 0;
+  uint32_t flowWhileOffSinceMs = 0;
 
-// ================= MODULE 5: GIAO TIẾP ESP-NOW =================
+  float flowLpm = 0.0f;
+  float totalL  = 0.0f; // tổng tích luỹ
+};
 
-// Hàm Gửi Báo Cáo
-void sendReport() {
-  myData.id = MY_ID;
-  
-  // Gói dữ liệu Zone 1 (Mặc định báo cáo Zone 1 trước)
-  // Trong thực tế có thể gửi mảng hoặc gửi lần lượt
-  myData.flow_rate = flowRate1; 
-  myData.total_vol = totalVol1;
-  
-  if (pump1Error) myData.status = 2.0; // 2 = Lỗi
-  else myData.status = pump1State ? 1.0 : 0.0;
+static PumpState p1, p2;
 
-  esp_err_t result = esp_now_send(gatewayMac, (uint8_t *) &myData, sizeof(myData));
-  
-  if (result == ESP_OK) Serial.println(">> Gửi báo cáo OK");
-  else Serial.println(">> Gửi Lỗi");
-}
+static float tankLevelPct = 0.0f;
+static float tankLevelL   = 0.0f;
+static bool  tankLowSwitch = false;
+static uint32_t tankFlagsBits = 0;
 
-// Hàm Nhận Lệnh (Callback)
-void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-  // Vì Gateway hiện tại chưa gửi lệnh xuống (chưa code phần RPC),
-  // nên hàm này để chờ (Placeholder) cho tính năng mở rộng sau này.
-  // Khi bạn code Gateway gửi lệnh, ta sẽ parse struct_command ở đây.
-  Serial.print("Nhận lệnh: ");
-  Serial.println(len);
+static bool centralHasError = false;
+
+// ======================================================
+// 6) ISR - FLOW SENSOR
+// ======================================================
+void IRAM_ATTR pulseCounter1() { pulseCount1++; }
+void IRAM_ATTR pulseCounter2() { pulseCount2++; }
+
+// ======================================================
+// 7) HÀM PHỤ TRỢ
+// ======================================================
+static inline void relayWrite(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
 }
 
-// ================= MODULE 6: LOGIC ĐIỀU KHIỂN & BẢO VỆ =================
+static inline float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
 
-void calculateFlowAndProtect() {
-  // Chỉ tính toán mỗi 1 giây (1000ms)
-  if ((millis() - oldTime) > 1000) {
-    
-    // 1. Ngắt đếm tạm thời để đọc dữ liệu
-    detachInterrupt(digitalPinToInterrupt(FLOW_1_PIN));
-    
-    // 2. Tính toán: (Số xung / 7.5) = Lít/phút
-    flowRate1 = ((1000.0 / (millis() - oldTime)) * pulseCount1) / CALIBRATION_FACTOR;
-    
-    // 3. Cộng dồn tổng tích lũy (Lít) -> Chia 60 vì flowRate là L/phút
-    totalVol1 += (flowRate1 / 60.0);
-    
-    // 4. LOGIC BẢO VỆ CHẠY KHÔ (Dry Run Protection)
-    if (pump1State && !pump1Error) {
-      // Nếu bơm đang bật
-      unsigned long runTime = millis() - pump1StartTime;
-      
-      // Sau 10 giây khởi động mà nước vẫn không chảy (Flow < 1.0)
-      if (runTime > 10000 && flowRate1 < 1.0) {
-        Serial.println("!!! CẢNH BÁO: BƠM CHẠY KHÔ -> NGẮT KHẨN CẤP !!!");
-        digitalWrite(RELAY_1_PIN, LOW); // Ngắt relay cứng
-        pump1State = false;
-        pump1Error = true; // Set cờ lỗi
+static void loadPersistent() {
+  prefs.begin("central", true);
+  p1.totalL = prefs.getFloat("p1_totalL", 0.0f);
+  p2.totalL = prefs.getFloat("p2_totalL", 0.0f);
+  prefs.end();
+}
+
+static void savePersistent() {
+  prefs.begin("central", false);
+  prefs.putFloat("p1_totalL", p1.totalL);
+  prefs.putFloat("p2_totalL", p2.totalL);
+  prefs.end();
+}
+
+static void updateTankLevel() {
+  tankFlagsBits = 0;
+
+  // Float switch báo cạn (nếu có)
+  if (TANK_MODE == TANK_LEVEL_FLOAT_SWITCH) {
+    tankLowSwitch = (digitalRead(TANK_LOW_SWITCH_PIN) == LOW); // active low
+    if (tankLowSwitch) tankFlagsBits |= TANK_FLAG_LOW_SWITCH;
+
+    // Ở đây set 0% khi cạn, 80% khi OK (giả định)..
+    tankLevelPct = tankLowSwitch ? 0.0f : 80.0f;
+    tankLevelL   = (tankLevelPct / 100.0f) * TANK_CAPACITY_L;
+    return;
+  }
+
+  // Analog % (khuyến nghị nếu muốn hiển thị L/PCT "thật")
+  int raw = analogRead(TANK_LEVEL_ADC_PIN);
+  float pct = 0.0f;
+
+  if (TANK_ADC_MAX <= TANK_ADC_MIN) {
+    // tránh cấu hình sai
+    pct = 0.0f;
+  } else {
+    pct = 100.0f * (float)(raw - TANK_ADC_MIN) / (float)(TANK_ADC_MAX - TANK_ADC_MIN);
+  }
+
+  tankLevelPct = clampf(pct, 0.0f, 100.0f);
+  tankLevelL   = (tankLevelPct / 100.0f) * TANK_CAPACITY_L;
+
+  if (tankLevelPct <= TANK_LOW_PCT_THRESHOLD) tankFlagsBits |= TANK_FLAG_LOW_PCT;
+
+  // Nếu  vẫn có float switch kèm theo (optional), bật dòng dưới:
+  // tankLowSwitch = (digitalRead(TANK_LOW_SWITCH_PIN) == LOW);
+  // if (tankLowSwitch) tankFlagsBits |= TANK_FLAG_LOW_SWITCH;
+}
+
+static void updateFlowAndTotals(uint32_t dtMs) {
+  // Copy & clear pulse counts atomically
+  uint32_t c1, c2;
+  noInterrupts();
+  c1 = pulseCount1; pulseCount1 = 0;
+  c2 = pulseCount2; pulseCount2 = 0;
+  interrupts();
+
+  const float dtMin = (dtMs > 0) ? ((float)dtMs / 60000.0f) : 1.0f / 60.0f;
+
+  // liters during dt = pulses / pulses_per_liter
+  const float dL1 = (float)c1 / PULSES_PER_LITER;
+  const float dL2 = (float)c2 / PULSES_PER_LITER;
+
+  // flow (L/min) = delta liters / delta minutes
+  p1.flowLpm = (dtMin > 0) ? (dL1 / dtMin) : 0.0f;
+  p2.flowLpm = (dtMin > 0) ? (dL2 / dtMin) : 0.0f;
+
+  // total accumulate only when pump is ON (tuỳ logic hệ thống)
+  // Nếu flow meter nằm trên đường nước và vẫn có thể chảy khi OFF, vẫn nên cộng dL.
+  // Ở đây cộng luôn để phản ánh đúng lượng nước đi qua.
+  p1.totalL += dL1;
+  p2.totalL += dL2;
+}
+
+static void applyRelay(PumpState &p, int relayPin, uint32_t nowMs) {
+  // default: relay follows desiredOn
+  if (p.desiredOn != p.relayOn) {
+    p.relayOn = p.desiredOn;
+    relayWrite(relayPin, p.relayOn);
+
+    // reset timers
+    if (p.relayOn) {
+      p.onSinceMs = nowMs;
+      p.flowBadSinceMs = 0;
+    } else {
+      p.flowWhileOffSinceMs = 0;
+    }
+  }
+}
+
+static void evaluateSafetyForPump(PumpState &p, uint32_t nowMs) {
+  // --- Dry-run detection (pump ON but low flow) ---
+  if (p.relayOn) {
+    // grace period
+    if (nowMs - p.onSinceMs >= DRYRUN_GRACE_MS) {
+      if (p.flowLpm < MIN_FLOW_LPM) {
+        if (p.flowBadSinceMs == 0) p.flowBadSinceMs = nowMs;
+        if (nowMs - p.flowBadSinceMs >= DRYRUN_TIMEOUT_MS) {
+          p.dryRun = true;
+          p.desiredOn = false; // force OFF
+        }
+      } else {
+        p.flowBadSinceMs = 0;
+        p.dryRun = false;
       }
     }
+  } else {
+    p.flowBadSinceMs = 0;
+  }
 
-    // 5. Reset xung và nạp lại ngắt
-    oldTime = millis();
-    pulseCount1 = 0;
-    attachInterrupt(digitalPinToInterrupt(FLOW_1_PIN), pulseCounter1, FALLING);
-    
-    // In ra Monitor
-    Serial.printf("[Bể Chứa] Flow: %.2f L/min | Total: %.2f L | Pump: %d\n", 
-                  flowRate1, totalVol1, pump1State);
-    
-    // Gửi báo cáo về Gateway
+  // --- Relay stuck estimation (pump OFF but still has flow) ---
+  if (!p.relayOn) {
+    if (p.flowLpm > RELAY_STUCK_FLOW_LPM) {
+      if (p.flowWhileOffSinceMs == 0) p.flowWhileOffSinceMs = nowMs;
+      if (nowMs - p.flowWhileOffSinceMs >= RELAY_STUCK_TIMEOUT_MS) {
+        p.relayStuck = true;
+      }
+    } else {
+      p.flowWhileOffSinceMs = 0;
+      p.relayStuck = false;
+    }
+  } else {
+    p.flowWhileOffSinceMs = 0;
+
+    p.relayStuck = false;
+  }
+}
+
+static void applyFailSafe(uint32_t nowMs) {
+  // Reset global error
+  centralHasError = false;
+
+  // Tank low -> force OFF cả 2 bơm
+  bool tankLow = (tankFlagsBits & (TANK_FLAG_LOW_PCT | TANK_FLAG_LOW_SWITCH)) != 0;
+  if (tankLow) {
+    p1.desiredOn = false;
+    p2.desiredOn = false;
+    centralHasError = true;
+  }
+
+  // Per-pump safety
+  evaluateSafetyForPump(p1, nowMs);
+  evaluateSafetyForPump(p2, nowMs);
+
+  if (p1.dryRun || p1.relayStuck || p2.dryRun || p2.relayStuck) {
+    centralHasError = true;
+  }
+}
+
+static int pumpStatusBits(const PumpState &p) {
+  int bits = 0;
+  if (p.relayOn)    bits |= PUMP_BIT_ON;
+  if (p.dryRun)     bits |= PUMP_BIT_DRYRUN;
+  if (p.relayStuck) bits |= PUMP_BIT_RELAY_STUCK;
+  return bits;
+}
+
+// ======================================================
+// 8) ESPNOW SEND REPORT
+// ======================================================
+static void sendMsg(int id, float temp, float hum, float soil) {
+  struct_message msg;
+  msg.id = id;
+  msg.temp = temp;
+  msg.hum  = hum;
+  msg.soil = soil;
+  esp_now_send(GATEWAY_MAC, (uint8_t *)&msg, sizeof(msg));
+}
+
+static void sendReport() {
+  // Central summary: Gateway đang map thành keys: flow_rate, total_volume, pump_status
+  // => gửi tổng flow và tổng volume.
+  float totalFlow = p1.flowLpm + p2.flowLpm;
+  float totalVol  = p1.totalL  + p2.totalL;
+
+  int bitsPumps = 0;
+  bitsPumps |= (pumpStatusBits(p1) & 0xFF) << 0;
+  bitsPumps |= (pumpStatusBits(p2) & 0xFF) << 8;
+
+  // Theo gateway: centralSumError = (soil == 2)
+  float errorCode = centralHasError ? 2.0f : 0.0f;
+
+  sendMsg(ID_CENTRAL_SUM, totalFlow, totalVol, errorCode);
+
+  // Pump 1 / 2
+  sendMsg(ID_PUMP1, p1.flowLpm, p1.totalL, (float)pumpStatusBits(p1));
+  sendMsg(ID_PUMP2, p2.flowLpm, p2.totalL, (float)pumpStatusBits(p2));
+
+  // Tank
+  sendMsg(ID_TANK, tankLevelPct, tankLevelL, (float)tankFlagsBits);
+}
+
+// ======================================================
+// 9) ESPNOW RECEIVE COMMAND
+// ======================================================
+static void onReceive(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (len != (int)sizeof(struct_command)) return;
+  struct_command cmd;
+  memcpy(&cmd, incomingData, sizeof(cmd));
+
+  // cmd_id=1: set pump on/off
+  if (cmd.cmd_id == 1) {
+    bool on = (cmd.action == 1);
+
+    if (cmd.pump_id == 1) p1.desiredOn = on;
+    else if (cmd.pump_id == 2) p2.desiredOn = on;
+
+    // Apply ngay để UI phản hồi nhanh
+    uint32_t nowMs = millis();
+    applyFailSafe(nowMs);
+    applyRelay(p1, RELAY_1_PIN, nowMs);
+    applyRelay(p2, RELAY_2_PIN, nowMs);
     sendReport();
   }
 }
 
-// Hàm bật tắt bơm (Dùng để test)
-void togglePump1() {
-  if (pump1Error) {
-    Serial.println("Đang lỗi, cần Reset hệ thống mới được bơm lại!");
-    return;
-  }
-  
-  pump1State = !pump1State;
-  digitalWrite(RELAY_1_PIN, pump1State ? HIGH : LOW);
-  
-  if (pump1State) {
-    pump1StartTime = millis(); // Ghi lại giờ bắt đầu để tính timeout
-    Serial.println("-> BẬT BƠM 1");
-  } else {
-    Serial.println("-> TẮT BƠM 1");
-  }
-}
-
-// ================= SETUP =================
+// ======================================================
+// 10) SETUP / LOOP
+// ======================================================
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== NODE BỂ CHỨA (CENTRAL STATION) ===");
+  delay(200);
 
-  // 1. Cấu hình PIN
+  // Relay init
   pinMode(RELAY_1_PIN, OUTPUT);
   pinMode(RELAY_2_PIN, OUTPUT);
-  digitalWrite(RELAY_1_PIN, LOW); // Mặc định tắt
-  digitalWrite(RELAY_2_PIN, LOW);
+  // default OFF
+  relayWrite(RELAY_1_PIN, false);
+  relayWrite(RELAY_2_PIN, false);
 
-  pinMode(FLOW_1_PIN, INPUT_PULLUP);
-  pinMode(WATER_LEVEL_PIN, INPUT_PULLUP); // Nối đất = Cạn (LOW)
+  // Tank pins
+  if (TANK_MODE == TANK_LEVEL_FLOAT_SWITCH) {
+    pinMode(TANK_LOW_SWITCH_PIN, INPUT_PULLUP);
+  } else {
+    pinMode(TANK_LEVEL_ADC_PIN, INPUT);
+    analogReadResolution(12);
+    analogSetPinAttenuation(TANK_LEVEL_ADC_PIN, ADC_11db); // 0..3.3V (tuỳ board)
+    //
+    // pinMode(TANK_LOW_SWITCH_PIN, INPUT_PULLUP);
+  }
 
-  // 2. Cấu hình Ngắt
+  // Flow pins + interrupts
+  pinMode(FLOW_1_PIN, INPUT); // Flow sensor thường cần pull-up; nếu pin không có pull-up nội (GPIO34/35) thì dùng điện trở kéo lên ngoài
+  pinMode(FLOW_2_PIN, INPUT); // giống FLOW_1_PIN
   attachInterrupt(digitalPinToInterrupt(FLOW_1_PIN), pulseCounter1, FALLING);
-  
-  // 3. ESP-NOW Init
-  esp_base_mac_addr_set(myMac);
+  attachInterrupt(digitalPinToInterrupt(FLOW_2_PIN), pulseCounter2, FALLING);
+
+  // Load persisted totals
+  loadPersistent();
+
+  // ESP-NOW init
+  esp_base_mac_addr_set(CENTRAL_BASE_MAC);
   WiFi.mode(WIFI_STA);
+
+  // Giữ channel cố định
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
-  if (esp_now_init() != ESP_OK) return;
-  
-  // Đăng ký nhận lệnh
-  esp_now_register_recv_cb(OnDataRecv);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] init FAILED");
+    while (true) delay(1000);
+  }
 
-  // Add Gateway Peer (Để gửi báo cáo)
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memcpy(peerInfo.peer_addr, gatewayMac, 6);
-  peerInfo.channel = WIFI_CHANNEL;  
+  esp_now_register_recv_cb(onReceive);
+
+  esp_now_peer_info_t peerInfo{};
+  memcpy(peerInfo.peer_addr, GATEWAY_MAC, 6);
+  peerInfo.channel = WIFI_CHANNEL;
   peerInfo.encrypt = false;
-  esp_now_add_peer(&peerInfo);
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("[ESP-NOW] add peer FAILED");
+    while (true) delay(1000);
+  }
+
+  Serial.println("[Central] Ready (REAL HARDWARE)");
 }
 
-// ================= LOOP =================
 void loop() {
-  // 1. Tính toán & Bảo vệ (Chạy mỗi 1s)
-  calculateFlowAndProtect();
+  static uint32_t lastTick = 0;
+  static uint32_t lastReport = 0;
+  static uint32_t lastSave = 0;
 
-  // 2. Giả lập Lệnh điều khiển (Vì Gateway chưa gửi lệnh)
-  // Cơ chế: Chập chân GPIO 10 xuống đất để Reset lỗi hoặc Test bơm
-  if (digitalRead(WATER_LEVEL_PIN) == LOW) {
-    delay(100); // Chống rung
-    // Nếu đang lỗi thì Reset lỗi
-    if (pump1Error) {
-      pump1Error = false;
-      Serial.println("-> Đã Reset Lỗi!");
-    } else {
-      // Nếu không lỗi thì bật/tắt bơm để test
-      togglePump1();
-      delay(2000); // Delay để không bật tắt liên tục
-    }
+  const uint32_t now = millis();
+
+  // 1) Tick: update sensors + safety
+  if (now - lastTick >= TICK_MS) {
+    uint32_t dt = now - lastTick;
+    lastTick = now;
+
+    updateTankLevel();
+    updateFlowAndTotals(dt);
+    applyFailSafe(now);
+
+    // Apply relay after failsafe decision
+    applyRelay(p1, RELAY_1_PIN, now);
+    applyRelay(p2, RELAY_2_PIN, now);
+
+    // Debug log ngắn gọn
+    Serial.printf("[Central] tank=%.1f%% (%.0fL flags=%u) | P1(on=%d flow=%.2f tot=%.2f bits=%d) | P2(on=%d flow=%.2f tot=%.2f bits=%d) | err=%d\n",
+                  tankLevelPct, tankLevelL, (unsigned)tankFlagsBits,
+                  (int)p1.relayOn, p1.flowLpm, p1.totalL, pumpStatusBits(p1),
+                  (int)p2.relayOn, p2.flowLpm, p2.totalL, pumpStatusBits(p2),
+                  centralHasError ? 1 : 0);
+  }
+
+  // 2) Report to gateway
+  if (now - lastReport >= REPORT_MS) {
+    lastReport = now;
+    sendReport();
+  }
+
+  // 3) Save totals to NVS (không lưu quá thường xuyên)
+  if (now - lastSave >= SAVE_MS) {
+    lastSave = now;
+    savePersistent();
   }
 }

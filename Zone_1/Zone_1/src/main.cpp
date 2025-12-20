@@ -14,7 +14,7 @@
 #define SOIL_PIN    1 // Cảm biến độ ẩm đất nối vào ADC1_1 (PIN 1 / GPIO1)   
 
 // ================= 2. CẤU HÌNH MẠNG =================
-#define WIFI_CHANNEL 6  // Bắt buộc trùng Gateway
+#define WIFI_CHANNEL 1  // Bắt buộc trùng Gateway
 
 // ================= 3. CẤU HÌNH LOGIC BIÊN (EDGE CONFIG) =================
 // Ngưỡng thay đổi để kích hoạt gửi (Delta)
