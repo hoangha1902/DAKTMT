@@ -3,7 +3,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Wire.h>
-#include <Adafruit_AHTX0.h>
+#include "DHT20.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -11,171 +11,177 @@
 #define I2C_SDA_PIN 11
 #define I2C_SCL_PIN 12
 
-#define SOIL_PIN    1 // Cảm biến độ ẩm đất nối vào ADC1_1 (PIN 1 / GPIO1)   
+// Pin cảm biến độ ẩm đất
+#define SOIL_PIN    1 // GPIO1
 
 // ================= 2. CẤU HÌNH MẠNG =================
-#define WIFI_CHANNEL 1  // Bắt buộc trùng Gateway
+#define WIFI_CHANNEL 11  
 
 // ================= 3. CẤU HÌNH LOGIC BIÊN (EDGE CONFIG) =================
-// Ngưỡng thay đổi để kích hoạt gửi (Delta)
-#define DIFF_SOIL 2.0   // Chỉ gửi nếu độ ẩm đất lệch >= 2%
-#define DIFF_TEMP 0.5   // Chỉ gửi nếu nhiệt độ lệch >= 0.5 độ
-#define HEARTBEAT_MS 30000 // 30 giây gửi 1 lần (Heartbeat) nếu không có gì thay đổi // thực tế thì set 900000 // 15 phút
+#define DIFF_SOIL 2.0   // Thay đổi >= 2% mới gửi
+#define DIFF_TEMP 0.5   // Thay đổi >= 0.5 độ mới gửi
+#define HEARTBEAT_MS 30000 // 30s gửi báo cáo định kỳ 1 lần
 
-// Mốc hiệu chỉnh (Tạm để mặc định, tính sau)
-const int DRY_VALUE = 3200; 
-const int WET_VALUE = 1200; 
+// [CALIBRATION] Cần đo thực tế để sửa 2 số này
+const int DRY_VALUE = 3200; // Giá trị khi để ngoài không khí
+const int WET_VALUE = 1200; // Giá trị khi nhúng vào nước
 
-// ================= 4. ĐỊA CHỈ MAC & DATA =================
+// ================= 4. KHAI BÁO BIẾN & ĐỐI TƯỢNG =================
+DHT20 dht20; // Khởi tạo đối tượng DHT20
+
+// Địa chỉ MAC của Gateway
 uint8_t gatewayMac[] = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x01};
-uint8_t myMac[]      = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x02}; // Zone 1
 
-typedef struct {
-  int id;       
-  float temp;   
-  float hum;
-  float soil;   
+// Địa chỉ MAC của Zone 1 (cố định để Gateway nhận diện)
+uint8_t myMac[]      = {0x7C, 0xDF, 0xA1, 0x00, 0x00, 0x02};
+
+typedef struct struct_message {
+  int id;             
+  float temp;         
+  float hum;          
+  float soil;         
 } struct_message;
 
 struct_message myData;
-Adafruit_AHTX0 aht; 
 
-// Biến lưu trạng thái cũ để so sánh
-float lastSentSoil = -100.0;
-float lastSentTemp = -100.0;
-unsigned long lastSentTime = 0;
+// Biến lưu trạng thái cũ để so sánh (Delta Check)
+float lastSoil = 0;
+float lastTemp = 0;
+unsigned long lastSendTime = 0;
 
-// ================= 5. HÀM XỬ LÝ (ALGORITHMS) =================
-
-// --- THUẬT TOÁN 1: LỌC TRUNG VỊ (MEDIAN FILTER) ---
-// Giúp loại bỏ nhiễu gai, làm mượt dữ liệu cảm biến đất
+// ================= 5. HÀM ĐỌC ĐẤT (MEDIAN FILTER) =================
+// Đọc 15 lần, loại bỏ nhiễu, lấy trung bình -> Cực kỳ ổn định
 int readSoilMoistureStable() {
-  const int SAMPLES = 15;
-  int rawValues[SAMPLES];
-
-  // A. Lấy 15 mẫu liên tiếp
-  for (int i = 0; i < SAMPLES; i++) {
-    rawValues[i] = analogRead(SOIL_PIN);
-    delay(10); 
+  int values[15];
+  for (int i = 0; i < 15; i++) {
+    values[i] = analogRead(SOIL_PIN);
+    delay(10);
   }
-
-  // B. Sắp xếp từ bé đến lớn (Bubble Sort)
-  for (int i = 0; i < SAMPLES - 1; i++) {
-    for (int j = i + 1; j < SAMPLES; j++) {
-      if (rawValues[i] > rawValues[j]) {
-        int temp = rawValues[i];
-        rawValues[i] = rawValues[j];
-        rawValues[j] = temp;
+  
+  // Sắp xếp mảng (Bubble sort)
+  for (int i = 0; i < 14; i++) {
+    for (int j = i + 1; j < 15; j++) {
+      if (values[i] > values[j]) {
+        int temp = values[i];
+        values[i] = values[j];
+        values[j] = temp;
       }
     }
   }
-
-  // C. Bỏ 3 mẫu nhỏ nhất và 3 mẫu lớn nhất -> Lấy trung bình 9 mẫu giữa
+  
+  // Bỏ 3 mẫu đầu, 3 mẫu cuối, lấy trung bình 9 mẫu giữa
   long sum = 0;
-  for (int i = 3; i < 12; i++) {
-    sum += rawValues[i];
-  }
+  for (int i = 3; i < 12; i++) sum += values[i];
   int avgRaw = sum / 9;
 
-  // D. Map sang %
+  // Map sang phần trăm (0-100%)
   int percent = map(avgRaw, DRY_VALUE, WET_VALUE, 0, 100);
+  
+  // Kẹp giá trị trong khoảng 0-100
   if (percent > 100) percent = 100;
   if (percent < 0) percent = 0;
-
+  
   return percent;
 }
 
-// --- HÀM GỬI DỮ LIỆU ---
-void sendData(bool isHeartbeat) {
-  myData.id = 1; // ID Zone 1
-  
+// ================= 6. GỬI DỮ LIỆU (ESP-NOW) =================
+void sendData() {
   esp_err_t result = esp_now_send(gatewayMac, (uint8_t *) &myData, sizeof(myData));
-  
   if (result == ESP_OK) {
-    if (isHeartbeat) Serial.print("[Heartbeat] ");
-    else Serial.print("[Change] ");
-    
-    Serial.printf("Gửi OK: Soil=%d%%, Temp=%.2f\n", (int)myData.soil, myData.temp);
-
-    // Cập nhật "ký ức"
-    lastSentSoil = myData.soil;
-    lastSentTemp = myData.temp;
-    lastSentTime = millis();
+    Serial.printf(">> Zone 1 Gửi OK: Soil=%.1f, Temp=%.1f\n", myData.soil, myData.temp);
+    lastSoil = myData.soil;
+    lastTemp = myData.temp;
+    lastSendTime = millis();
   } else {
-    Serial.println("Gửi Lỗi");
+    Serial.println(">> Zone 1 Gửi Lỗi!");
   }
 }
 
-// Callback
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Không in gì ở đây để đỡ rối monitor, đã in ở hàm sendData
-}
+// Callback 
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
 
-// ================= 6. SETUP =================
+// ================= 7. SETUP =================
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
   Serial.begin(115200);
-  delay(2000);
-  Serial.println("\n=== ZONE 1: EDGE COMPUTING ENABLED ===");
+  delay(1000);
 
-  // Init Hardware
+  Serial.println("=== ZONE 1 STARTING (DHT20 + Soil) ===");
+
+  // 1. Init I2C & DHT20
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  if (!aht.begin()) Serial.println("Lỗi DHT20");
-  pinMode(SOIL_PIN, INPUT);
+  dht20.begin(); // Khởi động DHT20
+  
+  // Đợi cảm biến ổn định
+  delay(1000);
+  if (dht20.isConnected()) {
+    Serial.println("DHT20 Connected!");
+  } else {
+    Serial.println("DHT20 NOT found! Kiem tra day noi.");
+  }
 
-  // Set MAC & WiFi
+  // 2. Init Wifi & ESP-NOW
   esp_base_mac_addr_set(myMac);
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_max_tx_power(50);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
-  // Init ESP-NOW
-  if (esp_now_init() != ESP_OK) return;
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Init Failed");
+    ESP.restart();
+  }
   esp_now_register_send_cb(OnDataSent);
 
-  // Add Gateway Peer
+  // 3. Đăng ký Gateway Peer
   esp_now_peer_info_t peerInfo;
   memset(&peerInfo, 0, sizeof(peerInfo));
   memcpy(peerInfo.peer_addr, gatewayMac, 6);
   peerInfo.channel = WIFI_CHANNEL;  
   peerInfo.encrypt = false;
-  esp_now_add_peer(&peerInfo);
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+  }
+
+  // ID của Zone 1 là 1
+  myData.id = 1; 
 }
 
-// ================= 7. LOOP (LOGIC THÔNG MINH) =================
+// ================= 8. LOOP =================
 void loop() {
-  // 1. Đọc & Lọc nhiễu Đất (Median Filter)
+  // --- 1. Đọc Độ Ẩm Đất ---
   myData.soil = (float)readSoilMoistureStable();
 
-  // 2. Đọc & Kiểm tra DHT20 (Validation)
-  sensors_event_t humidity, temp;
-  if (aht.begin()) {
-    aht.getEvent(&humidity, &temp);
-    // Chỉ nhận nếu nhiệt độ hợp lý (-10 đến 80 độ) để lọc giá trị rác
-    if (!isnan(temp.temperature) && temp.temperature > -10 && temp.temperature < 80) {
-      myData.temp = temp.temperature;
-      myData.hum = humidity.relative_humidity;
-    }
-  }
-
-  // 3. CHIẾN LƯỢC QUYẾT ĐỊNH GỬI (Decision Making)
+  // --- 2. Đọc DHT20 ---
+  //đọc DHT20 trước khi get giá trị
+  int status = dht20.read();
   
-  // A. Kiểm tra sự thay đổi (Delta Check)
-  bool soilChanged = abs(myData.soil - lastSentSoil) >= DIFF_SOIL;
-  bool tempChanged = abs(myData.temp - lastSentTemp) >= DIFF_TEMP;
-
-  // B. Kiểm tra thời gian chờ (Heartbeat Check)
-  bool timeOut = (millis() - lastSentTime) >= HEARTBEAT_MS;
-
-  // C. Quyết định
-  if (soilChanged || tempChanged || timeOut) {
-    sendData(timeOut); 
+  if (status == DHT20_OK) {
+    myData.temp = dht20.getTemperature();
+    myData.hum = dht20.getHumidity();
   } else {
-    // Không làm gì cả -> Tiết kiệm pin & băng thông
-    // Serial.println("... Waiting ...");
+    // Nếu đọc lỗi, giữ giá trị cũ
+    Serial.print("DHT20 Error Code: ");
+    Serial.println(status);
   }
 
-  delay(1000); // Đọc 1s/lần
+  // --- 3. Logic Gửi---
+  bool needSend = false;
+
+  // Điều kiện 1: Thay đổi đột ngột (Delta)
+  if (abs(myData.soil - lastSoil) >= DIFF_SOIL) needSend = true;
+  if (abs(myData.temp - lastTemp) >= DIFF_TEMP) needSend = true;
+
+  // Điều kiện 2: Định kỳ (Heartbeat)
+  if (millis() - lastSendTime > HEARTBEAT_MS) needSend = true;
+
+  if (needSend) {
+    // Chống xung đột: Random 0-200ms
+    delay(random(0, 200)); 
+    sendData();
+  }
+
+
+  delay(1000);
 }
